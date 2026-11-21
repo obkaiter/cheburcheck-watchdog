@@ -59,6 +59,7 @@ class Config:
     interval: int = DEFAULT_INTERVAL
     telegram_token: str = field(default="", repr=False)
     telegram_chat_id: str = ""
+    telegram_topic_id: Optional[int] = None
 
 
 def normalize_target(raw):
@@ -116,6 +117,14 @@ def normalize_chat_id(value):
     raise ValueError("Укажите числовой Chat ID или @username группы либо канала.")
 
 
+def normalize_topic_id(value):
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,10}", value):
+        value = int(value)
+    if type(value) is not int or not 0 < value < 2**31:
+        raise ValueError("Укажите Topic ID от 1 до 2147483647.")
+    return value
+
+
 def load_config(path=CONFIG_PATH, *, allow_missing=False):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -130,16 +139,19 @@ def load_config(path=CONFIG_PATH, *, allow_missing=False):
     interval = data.get("interval", DEFAULT_INTERVAL)
     telegram_token = data.get("telegram_token", "")
     telegram_chat_id = data.get("telegram_chat_id", "")
+    telegram_topic_id = data.get("telegram_topic_id")
     if (token != "" and not valid_token(token)) or not isinstance(targets, list):
         raise ValueError("Некорректный токен Cheburcheck или список проверок в конфигурации.")
     if type(interval) is not int or interval not in INTERVALS:
         raise ValueError("Некорректный период проверки в конфигурации.")
-    if telegram_token != "" or telegram_chat_id != "":
+    if telegram_token != "" or telegram_chat_id != "" or telegram_topic_id is not None:
         if not valid_telegram_token(telegram_token):
             raise ValueError("Некорректный токен бота Telegram в конфигурации.")
         telegram_chat_id = normalize_chat_id(telegram_chat_id)
+        if telegram_topic_id is not None:
+            telegram_topic_id = normalize_topic_id(telegram_topic_id)
     return Config(token, tuple(dict.fromkeys(map(normalize_target, targets))), interval,
-                  telegram_token, telegram_chat_id)
+                  telegram_token, telegram_chat_id, telegram_topic_id)
 
 
 def save_config(config, path=CONFIG_PATH):
@@ -325,12 +337,15 @@ def check_target(target, token):
     return report
 
 
-def send_telegram(token, chat_id, text):
-    body = json.dumps({
+def send_telegram(token, chat_id, text, *, topic_id=None):
+    message = {
         "chat_id": chat_id if chat_id.startswith("@") else int(chat_id),
         "text": text,
         "link_preview_options": {"is_disabled": True},
-    }, ensure_ascii=False).encode("utf-8")
+    }
+    if topic_id is not None and topic_id != 1:
+        message["message_thread_id"] = topic_id
+    body = json.dumps(message, ensure_ascii=False).encode("utf-8")
     with request("Telegram", f"/bot{token}/sendMessage", "application/json",
                  host=TELEGRAM_HOST, body=body) as response:
         result = read_json(response, "Telegram")
@@ -405,7 +420,8 @@ def check_batch(config, *, manual=False):
             for index, message in enumerate(report_messages(reports, len(config.targets), notice, manual=manual)):
                 if index:
                     time.sleep(TELEGRAM_MESSAGE_GAP)
-                send_telegram(config.telegram_token, config.telegram_chat_id, message)
+                send_telegram(config.telegram_token, config.telegram_chat_id, message,
+                              topic_id=config.telegram_topic_id)
         except (APIError, ResponseError) as error:
             if manual:
                 raise ResponseError(f"Проверка завершена. Не удалось отправить отчёт. {error}") from None

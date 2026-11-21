@@ -23,6 +23,7 @@ from watchdog import (
     load_config,
     normalize_chat_id,
     normalize_target,
+    normalize_topic_id,
     save_config,
     send_telegram,
     valid_telegram_token,
@@ -198,9 +199,24 @@ def configure_telegram(config):
     if not chat_id:
         return
     chat_id = normalize_chat_id(chat_id)
-    change_config(lambda current: replace(current, telegram_token=token, telegram_chat_id=chat_id))
+    topic_id = config.telegram_topic_id if chat_id == config.telegram_chat_id else None
+    hint = f"Enter — оставить {topic_id}, 0 — сбросить" if topic_id is not None else "Enter — пропустить"
+    topic_input = input(f"Topic ID ({hint}): ").strip()
+    if topic_input == "0":
+        topic_id = None
+    elif topic_input:
+        topic_id = normalize_topic_id(topic_input)
+    change_config(lambda current: replace(current, telegram_token=token, telegram_chat_id=chat_id,
+                                          telegram_topic_id=topic_id))
     print("Отчёты в Telegram включены.")
     pause()
+
+
+def telegram_destination(config):
+    destination = config.telegram_chat_id
+    if config.telegram_topic_id is not None:
+        destination += f" · тема {config.telegram_topic_id}"
+    return destination
 
 
 def telegram_menu():
@@ -209,7 +225,7 @@ def telegram_menu():
         items = [("configure", "Настроить бота и чат")]
         detail = "Отчёты отключены."
         if config.telegram_token:
-            detail = f"Чат для отчётов: {config.telegram_chat_id}"
+            detail = f"Чат для отчётов: {telegram_destination(config)}"
             items.extend([("test", "Отправить тестовое сообщение"),
                           ("disable", "Отключить отчёты", RED)])
         selected = choose(TELEGRAM_TITLE, items + [BACK], detail=detail)
@@ -219,14 +235,16 @@ def telegram_menu():
             if selected == "configure":
                 configure_telegram(config)
             elif selected == "test" and confirm("Отправить тестовое сообщение",
-                                                f"Watchdog отправит сообщение в чат {config.telegram_chat_id}."):
+                                                f"Watchdog отправит сообщение в чат {telegram_destination(config)}."):
                 send_telegram(config.telegram_token, config.telegram_chat_id,
-                              "🛡 Cheburcheck Watchdog\n✅ Тестовое сообщение. Доставка отчётов работает.")
+                              "🛡 Cheburcheck Watchdog\n✅ Тестовое сообщение. Доставка отчётов работает.",
+                              topic_id=config.telegram_topic_id)
                 print("Тестовое сообщение отправлено.")
                 pause()
-            elif selected == "disable" and confirm("Отключить отчёты", "Токен бота и чат будут удалены из настроек."
-                                                   " Проверки продолжат записываться в журнал."):
-                change_config(lambda current: replace(current, telegram_token="", telegram_chat_id=""))
+            elif selected == "disable" and confirm("Отключить отчёты", "Настройки Telegram будут удалены. "
+                                                   "Проверки продолжат записываться в журнал."):
+                change_config(lambda current: replace(current, telegram_token="", telegram_chat_id="",
+                                                      telegram_topic_id=None))
                 print("Отчёты в Telegram отключены.")
                 pause()
         except (APIError, ResponseError, ValueError) as error:
@@ -348,7 +366,7 @@ def manual_check_menu():
         raise ValueError("Выбранных доменов больше нет в списке проверок.")
     description = "Будут проверены все сохранённые домены." if selected == "all" else f"Будет проверен {selected}."
     if not confirm("Разовая проверка", f"{description} Отчёт будет отправлен в Telegram, "
-                   f"в чат {config.telegram_chat_id}."):
+                   f"в чат {telegram_destination(config)}."):
         return
     with check_lock(wait=False):
         print("Выполняется проверка…", flush=True)
