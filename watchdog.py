@@ -23,6 +23,7 @@ from urllib.parse import quote, urlencode
 CONFIG_PATH = Path("/etc/cheburcheck-watchdog/config.json")
 CHECK_DIR = Path("/run/cheburcheck-watchdog")
 STATE_DIR = Path("/var/lib/cheburcheck-watchdog")
+COOLDOWN_PATH = STATE_DIR / "check-cooldown.json"
 INTERVALS = {
     3600: "Раз в час",
     10800: "Раз в 3 часа",
@@ -33,7 +34,7 @@ INTERVALS = {
     604800: "Раз в неделю",
 }
 DEFAULT_INTERVAL = 21600
-BETWEEN_TARGETS = 5
+CHECK_REQUEST_INTERVAL = 125
 API_HOST = "cheburcheck.ru"
 API_ROOT = "/api/v1"
 TELEGRAM_HOST = "api.telegram.org"
@@ -199,6 +200,34 @@ class APIError(Exception):
 
 class ResponseError(Exception):
     pass
+
+
+def check_delay():
+    try:
+        deadline = json.loads(COOLDOWN_PATH.read_text(encoding="utf-8"))
+        if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline < 0:
+            raise ValueError
+    except FileNotFoundError:
+        return 0.0
+    except (ValueError, RecursionError, OverflowError):
+        raise ResponseError("Не удалось прочитать время следующей проверки Cheburcheck") from None
+    return max(0.0, deadline - time.time())
+
+
+def defer_check(seconds=CHECK_REQUEST_INTERVAL):
+    write_json(time.time() + seconds, COOLDOWN_PATH, mode=0o644)
+
+
+def wait_for_next_check(*, wait):
+    remaining = check_delay()
+    if remaining <= 0:
+        return
+    if not wait:
+        raise ResponseError(f"Следующая разовая проверка доступна через {math.ceil(remaining)} сек.")
+    LOG.info("Следующий запрос к Cheburcheck через %d сек.", math.ceil(remaining))
+    while remaining > 0:
+        time.sleep(min(3600, remaining))
+        remaining = check_delay()
 
 
 @dataclass
@@ -376,6 +405,8 @@ def check_target(target, token):
         context_id = lists.get("id")
         if not isinstance(context_id, str) or not context_id:
             raise ResponseError("Контекст для сетевых сканеров недоступен")
+        # Count from the scan request even if the preceding list lookup was slow.
+        defer_check()
         scan = scan_target(context_id, token)
     except (APIError, ResponseError) as error:
         report.error = error
@@ -529,6 +560,7 @@ def check_lock(*, wait):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            wait_for_next_check(wait=False)
             raise ResponseError("Уже выполняется проверка. Повторите попытку после её завершения.") from None
         yield
     finally:
@@ -540,16 +572,17 @@ def check_batch(config, *, manual=False, update_report=True):
     delay = 0
     notice = ""
     for index, target in enumerate(config.targets):
-        if index:
-            time.sleep(BETWEEN_TARGETS)
+        wait_for_next_check(wait=not manual or index > 0)
+        defer_check()
         report = check_target(target, config.token)
         if config.telegram_token:
             reports.append(report)
         error = report.error
         if isinstance(error, APIError):
             if error.status == 429:
-                delay = max(config.interval, error.retry_after)
-                notice = f"Лимит Cheburcheck. Следующий цикл не ранее чем через {delay} сек."
+                delay = max(CHECK_REQUEST_INTERVAL, error.retry_after)
+                defer_check(delay)
+                notice = f"Лимит Cheburcheck. Следующий запрос можно отправить через {delay} сек."
                 LOG.warning("%s", notice)
                 break
             if error.status == 401 and error.stage == "Сканеры":
@@ -583,8 +616,12 @@ def main():
         return 78
     LOG.info("Целей для проверки: %d. Период: %s.", len(config.targets), INTERVALS[config.interval])
     while True:
-        with check_lock(wait=True):
-            retry_after = check_batch(config)
+        retry_after = 0
+        try:
+            with check_lock(wait=True):
+                retry_after = check_batch(config)
+        except (OSError, ResponseError) as error:
+            LOG.error("Не удалось выполнить цикл проверок. %s", error)
         wake_at = time.monotonic() + max(config.interval, retry_after)
         while (remaining := wake_at - time.monotonic()) > 0:
             time.sleep(min(3600, remaining))

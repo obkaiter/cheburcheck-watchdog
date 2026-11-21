@@ -29,6 +29,7 @@ from watchdog import (
     send_telegram,
     valid_telegram_token,
     valid_token,
+    wait_for_next_check,
 )
 
 
@@ -373,7 +374,8 @@ def manual_check_menu():
         description = f"Будет проверен {selected}. Отчёт будет отправлен в чат {destination}."
     if not confirm("Разовая проверка", description):
         return
-    with install_lock(), check_lock(wait=False):
+    with check_lock(wait=False), install_lock():
+        wait_for_next_check(wait=False)
         print("Выполняется проверка…", flush=True)
         check_batch(replace(config, targets=targets), manual=True, update_report=all_domains)
     print("Общий отчёт в Telegram обновлён." if all_domains else "Отчёт о проверке отправлен в Telegram.")
