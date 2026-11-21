@@ -202,6 +202,10 @@ class ResponseError(Exception):
     pass
 
 
+class CheckInProgress(ResponseError):
+    pass
+
+
 def check_delay():
     try:
         deadline = json.loads(COOLDOWN_PATH.read_text(encoding="utf-8"))
@@ -560,8 +564,7 @@ def check_lock(*, wait):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            wait_for_next_check(wait=False)
-            raise ResponseError("Уже выполняется проверка. Повторите попытку после её завершения.") from None
+            raise CheckInProgress("Уже выполняется цикл проверок.") from None
         yield
     finally:
         os.close(fd)

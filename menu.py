@@ -1,5 +1,6 @@
 import fcntl
 import getpass
+import math
 import os
 import select
 import shutil
@@ -15,10 +16,12 @@ from watchdog import (
     APIError,
     CHECK_DIR,
     CONFIG_PATH,
+    CheckInProgress,
     INTERVALS,
     STATE_DIR,
     ResponseError,
     check_batch,
+    check_delay,
     check_lock,
     is_domain,
     load_config,
@@ -374,10 +377,24 @@ def manual_check_menu():
         description = f"Будет проверен {selected}. Отчёт будет отправлен в чат {destination}."
     if not confirm("Разовая проверка", description):
         return
-    with check_lock(wait=False), install_lock():
-        wait_for_next_check(wait=False)
-        print("Выполняется проверка…", flush=True)
-        check_batch(replace(config, targets=targets), manual=True, update_report=all_domains)
+    wait = False
+    while True:
+        try:
+            with check_lock(wait=wait), install_lock():
+                if get_config() != config:
+                    raise ResponseError("Настройки изменились. Запустите разовую проверку ещё раз.")
+                if wait and (remaining := math.ceil(check_delay())) > 0:
+                    print(f"До следующего запроса к Cheburcheck осталось {remaining} сек.", flush=True)
+                wait_for_next_check(wait=wait)
+                print("Выполняется проверка…", flush=True)
+                check_batch(replace(config, targets=targets), manual=True, update_report=all_domains)
+            break
+        except CheckInProgress:
+            if not confirm("Уже выполняется цикл проверок", "Разовая проверка начнётся после текущего цикла "
+                           "и обязательной паузы Cheburcheck. Оставьте меню открытым."):
+                return
+            print("Ожидаю завершения текущего цикла. Ctrl+C — отменить ожидание.", flush=True)
+            wait = True
     print("Общий отчёт в Telegram обновлён." if all_domains else "Отчёт о проверке отправлен в Telegram.")
     pause()
 
