@@ -16,6 +16,7 @@ from watchdog import (
     CHECK_DIR,
     CONFIG_PATH,
     INTERVALS,
+    STATE_DIR,
     ResponseError,
     check_batch,
     check_lock,
@@ -364,14 +365,18 @@ def manual_check_menu():
     )
     if not targets:
         raise ValueError("Выбранных доменов больше нет в списке проверок.")
-    description = "Будут проверены все сохранённые домены." if selected == "all" else f"Будет проверен {selected}."
-    if not confirm("Разовая проверка", f"{description} Отчёт будет отправлен в Telegram, "
-                   f"в чат {telegram_destination(config)}."):
+    all_domains = selected == "all"
+    destination = telegram_destination(config)
+    if all_domains:
+        description = f"Будут проверены все сохранённые домены. Общий отчёт в чате {destination} обновится."
+    else:
+        description = f"Будет проверен {selected}. Отчёт будет отправлен в чат {destination}."
+    if not confirm("Разовая проверка", description):
         return
-    with check_lock(wait=False):
+    with install_lock(), check_lock(wait=False):
         print("Выполняется проверка…", flush=True)
-        check_batch(replace(config, targets=targets), manual=True)
-    print("Отчёт о проверке отправлен в Telegram.")
+        check_batch(replace(config, targets=targets), manual=True, update_report=all_domains)
+    print("Общий отчёт в Telegram обновлён." if all_domains else "Отчёт о проверке отправлен в Telegram.")
     pause()
 
 
@@ -392,6 +397,11 @@ def uninstall():
             shutil.rmtree(CONFIG_PATH.parent)
         if CHECK_DIR.exists():
             CHECK_DIR.rmdir()
+        if STATE_DIR.is_symlink():
+            STATE_DIR.unlink()
+        for path in (STATE_DIR, STATE_DIR.parent / "private" / STATE_DIR.name):
+            if path.is_dir():
+                shutil.rmtree(path)
         shutil.rmtree(APP_DIR)
     print("Cheburcheck Watchdog удалён.")
     return True

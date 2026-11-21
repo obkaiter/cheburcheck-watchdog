@@ -22,6 +22,7 @@ from urllib.parse import quote, urlencode
 
 CONFIG_PATH = Path("/etc/cheburcheck-watchdog/config.json")
 CHECK_DIR = Path("/run/cheburcheck-watchdog")
+STATE_DIR = Path("/var/lib/cheburcheck-watchdog")
 INTERVALS = {
     3600: "Раз в час",
     10800: "Раз в 3 часа",
@@ -37,7 +38,6 @@ API_HOST = "cheburcheck.ru"
 API_ROOT = "/api/v1"
 TELEGRAM_HOST = "api.telegram.org"
 TELEGRAM_MESSAGE_LIMIT = 4096
-TELEGRAM_MESSAGE_GAP = 4
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 SSE_TIMEOUT = 180
 SSE_READ_TIMEOUT = 90
@@ -168,15 +168,21 @@ def load_config(path=CONFIG_PATH, *, allow_missing=False):
 
 
 def save_config(config, path=CONFIG_PATH):
+    write_json(vars(config), path)
+
+
+def write_json(data, path, *, mode=0o600):
     path.parent.mkdir(mode=0o700, exist_ok=True)
     staged = None
     try:
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
             staged = Path(stream.name)
-            json.dump(vars(config), stream, indent=2)
+            json.dump(data, stream, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if mode != 0o600:
+            staged.chmod(mode)
         staged.replace(path)
     finally:
         if staged is not None:
@@ -228,7 +234,7 @@ def retry_delay(value):
 
 
 @contextmanager
-def request(stage, path, media_type, *, token=None, host=API_HOST, body=None, timeout=20):
+def request(stage, path, media_type, *, token=None, host=API_HOST, body=None, timeout=20, statuses=(200,)):
     headers = {"Accept": media_type, "User-Agent": "Cheburcheck-Watchdog"}
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
@@ -238,7 +244,7 @@ def request(stage, path, media_type, *, token=None, host=API_HOST, body=None, ti
         with closing(HTTPSConnection(host, timeout=timeout, context=ssl.create_default_context())) as connection:
             connection.request("POST" if body is not None else "GET", path, body=body, headers=headers)
             with connection.getresponse() as response:
-                if response.status != 200:
+                if response.status not in statuses:
                     raise APIError(stage, response.status, retry_delay(response.getheader("Retry-After")))
                 if response.headers.get_content_type() != media_type:
                     raise ResponseError(f"{stage}: неожиданный тип ответа")
@@ -401,35 +407,86 @@ def check_target(target, token):
     return report
 
 
-def send_telegram(token, chat_id, text, *, topic_id=None):
+def send_telegram(token, chat_id, text, *, topic_id=None, message_id=None):
     message = {
         "chat_id": chat_id if chat_id.startswith("@") else int(chat_id),
         "text": text,
         "link_preview_options": {"is_disabled": True},
     }
-    if topic_id is not None and topic_id != 1:
+    method = "sendMessage"
+    statuses = (200,)
+    if message_id is not None:
+        method = "editMessageText"
+        statuses = (200, 400)
+        message["message_id"] = message_id
+    elif topic_id is not None and topic_id != 1:
         message["message_thread_id"] = topic_id
     body = json.dumps(message, ensure_ascii=False).encode("utf-8")
-    with request("Telegram", f"/bot{token}/sendMessage", "application/json",
-                 host=TELEGRAM_HOST, body=body) as response:
+    with request("Telegram", f"/bot{token}/{method}", "application/json",
+                 host=TELEGRAM_HOST, body=body, statuses=statuses) as response:
         result = read_json(response, "Telegram")
+        if response.status == 400:
+            description = str(result.get("description", "")).lower().removeprefix("bad request: ")
+            if description.partition(":")[0] == "message is not modified":
+                return True
+            if description in ("message to edit not found", "message_id_invalid"):
+                return None
+            raise APIError("Telegram", response.status)
     if result.get("ok") is not True:
         raise ResponseError("Telegram не подтвердил отправку сообщения")
+    return result.get("result", True)
 
 
-def report_messages(reports, total, notice, *, manual):
+def publish_report(config, text):
+    path = STATE_DIR / "telegram-report.json"
+    STATE_DIR.mkdir(mode=0o700, exist_ok=True)
+    destination = [config.telegram_token.partition(":")[0], config.telegram_chat_id,
+                   None if config.telegram_topic_id == 1 else config.telegram_topic_id]
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        state = {}
+    except (ValueError, RecursionError):
+        raise ResponseError("Некорректный файл состояния отчёта Telegram") from None
+    if not isinstance(state, dict):
+        raise ResponseError("Некорректный файл состояния отчёта Telegram")
+    if state.get("destination") == destination:
+        message_id = state.get("message_id")
+        chat_id = state.get("chat_id")
+        if type(message_id) is not int or message_id <= 0 or type(chat_id) is not int or chat_id == 0:
+            raise ResponseError("Некорректный идентификатор сохранённого отчёта Telegram")
+        if send_telegram(config.telegram_token, str(chat_id), text, message_id=message_id) is not None:
+            return
+
+    message = send_telegram(config.telegram_token, config.telegram_chat_id, text, topic_id=config.telegram_topic_id)
+    if not isinstance(message, dict) or not isinstance(message.get("chat"), dict):
+        raise ResponseError("Telegram не вернул данные отправленного отчёта")
+    message_id = message.get("message_id")
+    chat_id = message["chat"].get("id")
+    if type(message_id) is not int or message_id <= 0 or type(chat_id) is not int or chat_id == 0:
+        raise ResponseError("Telegram не вернул идентификатор отправленного отчёта")
+    # The admin and the DynamicUser both read this file inside the private state directory.
+    write_json({"destination": destination, "chat_id": chat_id, "message_id": message_id}, path, mode=0o644)
+
+
+def telegram_length(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def report_message(reports, total, notice, *, manual):
     time_label = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     label = "Разовая проверка" if manual else "Проверка по расписанию"
     header = (f"🛡 Cheburcheck Watchdog\n🕒 {label} · {time_label}"
               f"\n🔎 Целей обработано: {len(reports)} из {total}")
     if notice:
         header += f"\n⚠️ {notice}"
-    message = header
+    blocks = []
+    compact = []
     for report in reports:
         lines = [f"🌐 {report.target}"]
-        icon, status = VERDICT_STATUS[report.verdict]
+        verdict_icon, status = VERDICT_STATUS[report.verdict]
         label = "Итог по полученным данным" if report.incomplete else "Итог"
-        lines.append(f"{icon} {label}: {status}")
+        lines.append(f"{verdict_icon} {label}: {status}")
         if report.blocked is not None:
             listed = "есть совпадение" if report.blocked else "совпадений нет"
             lines.append(f"📋 Списки Cheburcheck: {listed}")
@@ -438,12 +495,29 @@ def report_messages(reports, total, notice, *, manual):
             lines.append(f"{icon} Сканеры API: {report.scanners}")
         if report.error:
             lines.append(f"⚠️ {report.error}")
-        block = "\n\n" + "\n".join(lines)
-        if len((message + block).encode("utf-16-le")) // 2 > TELEGRAM_MESSAGE_LIMIT:
-            yield message
-            message = header
-        message += block
-    yield message
+        blocks.append("\n".join(lines))
+        summary = f"{verdict_icon} {report.target} — {status}"
+        if report.error:
+            summary += f" ({report.error})"
+        elif report.incomplete:
+            summary += " (неполные данные)"
+        compact.append(summary)
+    message = "\n\n".join([header, *blocks])
+    if telegram_length(message) <= TELEGRAM_MESSAGE_LIMIT:
+        return message
+    message = header + "\n\n" + "\n".join(compact)
+    if telegram_length(message) <= TELEGRAM_MESSAGE_LIMIT:
+        return message
+
+    totals = Counter(VERDICT_STATUS[report.verdict][0] for report in reports)
+    header += "\n" + " · ".join(f"{icon} {count}" for icon, count in totals.items())
+    message = header + "\n"
+    for index, line in enumerate(compact):
+        footer = f"\n\nСокращено целей: {len(reports) - index}."
+        if telegram_length(message + "\n" + line + footer) > TELEGRAM_MESSAGE_LIMIT:
+            return message + footer
+        message += "\n" + line
+    return message
 
 
 @contextmanager
@@ -461,7 +535,7 @@ def check_lock(*, wait):
         os.close(fd)
 
 
-def check_batch(config, *, manual=False):
+def check_batch(config, *, manual=False, update_report=True):
     reports = []
     delay = 0
     notice = ""
@@ -484,12 +558,13 @@ def check_batch(config, *, manual=False):
                 break
     if reports:
         try:
-            for index, message in enumerate(report_messages(reports, len(config.targets), notice, manual=manual)):
-                if index:
-                    time.sleep(TELEGRAM_MESSAGE_GAP)
+            message = report_message(reports, len(config.targets), notice, manual=manual)
+            if update_report:
+                publish_report(config, message)
+            else:
                 send_telegram(config.telegram_token, config.telegram_chat_id, message,
                               topic_id=config.telegram_topic_id)
-        except (APIError, ResponseError) as error:
+        except (APIError, OSError, ResponseError) as error:
             if manual:
                 raise ResponseError(f"Проверка завершена. Не удалось отправить отчёт. {error}") from None
             LOG.warning("Не удалось отправить отчёт: %s", error)
