@@ -39,15 +39,28 @@ TELEGRAM_HOST = "api.telegram.org"
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_MESSAGE_GAP = 4
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-SSE_TIMEOUT = 90
+SSE_TIMEOUT = 180
+SSE_READ_TIMEOUT = 90
+# Cheburcheck 1.6.3 uses this order for each scanner's vote and for ties.
 VERDICTS = {
-    "ok": "доступен",
-    "uncertain": "неясно",
-    "cdn_block": "блокировка CDN",
-    "sni_block": "блокировка SNI",
-    "dns_spoofing": "подмена DNS",
-    "tspu_block": "блокировка ТСПУ",
-    "whitelist": "исключение CDN",
+    "tspu_block": "ТСПУ блок",
+    "sni_block": "SNI блок",
+    "dns_spoofing": "Подмена DNS",
+    "whitelist": "Исключение для CDN",
+    "cdn_block": "CDN блок (16–20 КБ)",
+    "ok": "Доступен",
+    "uncertain": "Неясно",
+}
+BLOCKING_VERDICTS = {"tspu_block", "sni_block", "dns_spoofing", "cdn_block"}
+VERDICT_STATUS = {
+    "blocked": ("🚫", "Заблокирован по спискам Cheburcheck"),
+    "tspu_block": ("🚫", "Заблокирован — TCP на уровне ТСПУ"),
+    "sni_block": ("🚫", "Заблокирован — по имени домена в SNI"),
+    "dns_spoofing": ("🚫", "Заблокирован — подмена DNS"),
+    "cdn_block": ("🚫", "Недоступен — ограничение CDN (16–20 КБ)"),
+    "whitelist": ("🟡", "Исключение для CDN"),
+    "ok": ("✅", "Ограничений не обнаружено сканерами"),
+    "uncertain": ("⚠️", "Недостаточно данных"),
 }
 LOG = logging.getLogger("cheburcheck-watchdog")
 
@@ -183,11 +196,20 @@ class ResponseError(Exception):
 
 
 @dataclass
+class ProbeScan:
+    results: dict = field(default_factory=dict)
+    online: Optional[int] = None
+    received: Optional[int] = None
+    error: Optional[ResponseError] = None
+
+
+@dataclass
 class CheckResult:
     target: str
     blocked: Optional[bool] = None
+    verdict: str = "uncertain"
     scanners: str = ""
-    scanner_warning: bool = False
+    incomplete: bool = False
     error: Optional[Union[APIError, ResponseError]] = None
 
 
@@ -206,14 +228,14 @@ def retry_delay(value):
 
 
 @contextmanager
-def request(stage, path, media_type, *, token=None, host=API_HOST, body=None):
+def request(stage, path, media_type, *, token=None, host=API_HOST, body=None, timeout=20):
     headers = {"Accept": media_type, "User-Agent": "Cheburcheck-Watchdog"}
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
     if body is not None:
         headers["Content-Type"] = "application/json"
     try:
-        with closing(HTTPSConnection(host, timeout=20, context=ssl.create_default_context())) as connection:
+        with closing(HTTPSConnection(host, timeout=timeout, context=ssl.create_default_context())) as connection:
             connection.request("POST" if body is not None else "GET", path, body=body, headers=headers)
             with connection.getresponse() as response:
                 if response.status != 200:
@@ -221,6 +243,8 @@ def request(stage, path, media_type, *, token=None, host=API_HOST, body=None):
                 if response.headers.get_content_type() != media_type:
                     raise ResponseError(f"{stage}: неожиданный тип ответа")
                 yield response
+    except TimeoutError:
+        raise ResponseError(f"{stage}: истекло время ожидания данных") from None
     except (OSError, HTTPException) as error:
         raise ResponseError(f"{stage}: сбой соединения ({type(error).__name__})") from None
 
@@ -257,7 +281,7 @@ def sse_events(response):
     data = []
     remaining = MAX_RESPONSE_BYTES
     deadline = time.monotonic() + SSE_TIMEOUT
-    while remaining and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
         line = response.readline(min(remaining, 65536) + 1)
         if not line:
             return
@@ -277,29 +301,59 @@ def sse_events(response):
             event = value.decode("ascii", errors="replace")
         elif field_name == b"data":
             data.append(value)
-    raise ResponseError("Сканеры: превышен лимит размера или времени ожидания SSE")
+    raise ResponseError("Сканеры: истекло время ожидания события done")
 
 
 def scan_target(context_id, token):
     path = f"{API_ROOT}/probe/" + quote(context_id, safe="")
-    results = {}
-    with request("Сканеры", path, "text/event-stream", token=token) as response:
-        for event, raw in sse_events(response):
-            if event == "result":
-                result = decode_object(raw, "Ответ сканера")
-                probe_id = result.get("probe_id")
-                verdicts = result.get("verdicts")
-                if type(probe_id) not in (str, int) or not isinstance(verdicts, list):
-                    raise ResponseError("Сканеры: некорректный результат")
-                results[str(probe_id)] = result
-            elif event == "done":
-                done = decode_object(raw, "Завершение сканирования")
-                online = done.get("online_probes")
-                received = done.get("response_count")
-                if any(type(count) is not int or count < 0 for count in (online, received)):
-                    raise ResponseError("Сканеры: отсутствует число ответов")
-                return results, received, online
-    raise ResponseError("Сканеры: поток SSE закрылся до события done")
+    scan = ProbeScan()
+    try:
+        with request("Сканеры", path, "text/event-stream", token=token, timeout=SSE_READ_TIMEOUT) as response:
+            for event, raw in sse_events(response):
+                if event == "result":
+                    result = decode_object(raw, "Ответ сканера")
+                    probe_id = result.get("probe_id")
+                    if type(probe_id) not in (str, int) or not isinstance(result.get("verdicts"), list):
+                        raise ResponseError("Сканеры: некорректный результат")
+                    scan.results[str(probe_id)] = result
+                elif event in ("started", "done"):
+                    status = decode_object(raw, "Статус сканирования")
+                    online = status.get("online_probes")
+                    if type(online) is not int or online < 0:
+                        raise ResponseError("Сканеры: отсутствует число ожидаемых ответов")
+                    scan.online = online
+                    if event == "done":
+                        received = status.get("response_count")
+                        if type(received) is not int or received < 0:
+                            raise ResponseError("Сканеры: отсутствует итоговое число ответов")
+                        scan.received = received
+                        return scan
+        raise ResponseError("Сканеры: поток SSE закрылся до события done")
+    except ResponseError as error:
+        if scan.online is None and not scan.results:
+            raise
+        scan.error = error
+    return scan
+
+
+def count_scanner_verdicts(results, listed_cdn):
+    counts = Counter()
+    votes = Counter()
+    for result in results:
+        verdicts = {code for code in result["verdicts"] if isinstance(code, str) and code in VERDICTS}
+        if not listed_cdn and "cdn_block" in verdicts:
+            verdicts.remove("cdn_block")
+            verdicts.add("ok")
+        if listed_cdn and not result.get("cdn_unblocked") and result.get("host_results") != [] and "ok" in verdicts:
+            verdicts.add("cdn_block")
+        if verdicts & BLOCKING_VERDICTS:
+            verdicts.discard("ok")
+        counts.update(verdicts)
+        vote = next((code for code in VERDICTS if code in verdicts), None)
+        if vote is not None:
+            votes[vote] += 1
+    winner = max(VERDICTS, key=votes.__getitem__)
+    return counts, winner if votes[winner] and winner != "uncertain" else None
 
 
 def check_target(target, token):
@@ -308,32 +362,42 @@ def check_target(target, token):
         lists = check_lists(target)
         report.blocked = lists["blocked"]
         LOG.log(logging.WARNING if report.blocked else logging.INFO, "%s — по спискам: %s", target,
-                "найдена блокировка" if report.blocked else "блокировка не найдена")
+                "есть совпадение" if report.blocked else "совпадений нет")
+        if isinstance(lists.get("whitelist"), dict) and not lists.get("rkn_domain"):
+            report.verdict = "whitelist"
+        elif report.blocked:
+            report.verdict = "blocked"
         context_id = lists.get("id")
         if not isinstance(context_id, str) or not context_id:
             raise ResponseError("Контекст для сетевых сканеров недоступен")
-        results, received, online = scan_target(context_id, token)
+        scan = scan_target(context_id, token)
     except (APIError, ResponseError) as error:
         report.error = error
         LOG.warning("%s — %s", target, error)
         return report
 
-    counts = Counter()
-    for result in results.values():
-        counts.update({verdict for verdict in result["verdicts"]
-                       if isinstance(verdict, str) and verdict in VERDICTS})
-    summary = ", ".join(f"{VERDICTS[verdict]}: {counts[verdict]}"
-                        for verdict in VERDICTS if counts[verdict]) or "вердиктов нет"
-    cached = sum(result.get("cached") is True for result in results.values())
-    incomplete = not results or received < online or received != len(results)
-    report.scanners = f"{len(results)} из {online}, из кеша: {cached}. {summary}"
-    if incomplete:
+    results = scan.results.values()
+    total = len(results)
+    counts, winner = count_scanner_verdicts(results, listed_cdn=bool(lists.get("cdn_providers")))
+    report.verdict = winner or report.verdict
+    report.incomplete = scan.received is None or not (total == scan.received == scan.online)
+    report.error = scan.error
+    cached = sum(result.get("cached") is True for result in results)
+    answer_count = f"{total} из {scan.online}" if scan.online is not None else str(total)
+    report.scanners = f"{answer_count} ответов, из кеша: {cached}"
+    if report.incomplete:
         report.scanners += " (неполный результат)"
-    report.scanner_warning = incomplete or any(
-        counts[key] for key in ("uncertain", "cdn_block", "sni_block", "dns_spoofing", "tspu_block")
-    )
-    level = logging.WARNING if report.scanner_warning else logging.INFO
-    LOG.log(level, "%s — сканеры: %s", target, report.scanners)
+    if scan.received is not None and scan.received < scan.online:
+        report.scanners += ". API завершил ожидание остальных сканеров"
+    if scan.received is not None and scan.received != total:
+        report.scanners += f". Число ответов по данным API: {scan.received}"
+    if counts:
+        summary = ", ".join(f"{VERDICTS[code]}: {counts[code]}/{total}" for code in VERDICTS if counts[code])
+        report.scanners += f". {summary}"
+    level = logging.WARNING if report.incomplete or counts.keys() & BLOCKING_VERDICTS else logging.INFO
+    LOG.log(level, "%s — %s. Сканеры API: %s", target, VERDICT_STATUS[report.verdict][1], report.scanners)
+    if report.error:
+        LOG.warning("%s — %s", target, report.error)
     return report
 
 
@@ -363,12 +427,15 @@ def report_messages(reports, total, notice, *, manual):
     message = header
     for report in reports:
         lines = [f"🌐 {report.target}"]
+        icon, status = VERDICT_STATUS[report.verdict]
+        label = "Итог по полученным данным" if report.incomplete else "Итог"
+        lines.append(f"{icon} {label}: {status}")
         if report.blocked is not None:
-            lines.append("🚫 По спискам: найдена блокировка" if report.blocked
-                         else "✅ По спискам: блокировка не найдена")
+            listed = "есть совпадение" if report.blocked else "совпадений нет"
+            lines.append(f"📋 Списки Cheburcheck: {listed}")
         if report.scanners:
-            icon = "⚠️" if report.scanner_warning else "📡"
-            lines.append(f"{icon} Сканеры: {report.scanners}")
+            icon = "⚠️" if report.incomplete else "📡"
+            lines.append(f"{icon} Сканеры API: {report.scanners}")
         if report.error:
             lines.append(f"⚠️ {report.error}")
         block = "\n\n" + "\n".join(lines)
