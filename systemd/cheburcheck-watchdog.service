@@ -1,0 +1,19 @@
+[Unit]
+Description=Cheburcheck Watchdog
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/cheburcheck-watchdog/config.json
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 -u /opt/cheburcheck-watchdog/watchdog.py
+LoadCredential=config.json:/etc/cheburcheck-watchdog/config.json
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectHome=yes
+Restart=on-failure
+RestartSec=30s
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=multi-user.target

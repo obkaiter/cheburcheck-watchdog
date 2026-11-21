@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+if (( EUID != 0 )); then
+    printf '[x] Запустите Cheburcheck Watchdog через sudo.\n' >&2
+    exit 1
+fi
+
+app_path=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
+APP_DIR=$(dirname -- "$app_path") || exit 1
+source "$APP_DIR/lib/deploy.sh" || exit 1
+
+if (( $# )); then
+    if [[ $1 == --install && $# == 1 ]]; then
+        ensure_dependencies && install_payload "$APP_DIR"
+        exit $?
+    fi
+    printf 'Использование: cheburcheck-watchdog\n' >&2
+    exit 1
+fi
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+    printf '[x] Для работы с меню нужен интерактивный терминал.\n' >&2
+    exit 1
+fi
+
+ensure_dependencies || exit 1
+if [[ $APP_DIR != "$INSTALL_DIR" ]]; then
+    install_payload "$APP_DIR" || exit 1
+    exec "$COMMAND_LINK"
+fi
+
+version=$(read_version "$APP_DIR/VERSION") || exit 1
+printf '\033[2J\033[H\033[1;36mCheburcheck Watchdog\033[0m v%s\n' "$version"
+printf 'Автор: github.com/obkaiter\nПри поддержке BITWIRE.ME\n\nПроверка версии…\n'
+update_notice=
+check_for_updates "$version" || update_notice='Не удалось обновиться с GitHub. Открыта установленная версия.'
+exec /usr/bin/python3 "$INSTALL_DIR/menu.py" "$update_notice"
