@@ -11,7 +11,23 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
-from watchdog import CONFIG_PATH, INTERVALS, load_config, normalize_ip, save_config, valid_token
+from watchdog import (
+    APIError,
+    CHECK_DIR,
+    CONFIG_PATH,
+    INTERVALS,
+    ResponseError,
+    check_batch,
+    check_lock,
+    is_domain,
+    load_config,
+    normalize_chat_id,
+    normalize_target,
+    save_config,
+    send_telegram,
+    valid_telegram_token,
+    valid_token,
+)
 
 
 APP_DIR = Path("/opt/cheburcheck-watchdog")
@@ -26,6 +42,8 @@ RED = "\033[31m"
 BLUE = "\033[34m"
 DIM = "\033[2m"
 BACK = ("back", "Назад", BLUE)
+TOKEN_TITLE = "API-токен cheburcheck.ru"
+TELEGRAM_TITLE = "Отчёты в Telegram"
 
 
 def screen(title=None):
@@ -153,7 +171,7 @@ def change_config(change):
 
 
 def token_menu():
-    screen("API-токен Watchdog")
+    screen(TOKEN_TITLE)
     print("Токен сохранён." if get_config().token else "Токен ещё не задан.")
     print("Ввод скрыт. Enter без ввода — назад.\n")
     token = getpass.getpass("API-токен: ").strip()
@@ -166,30 +184,79 @@ def token_menu():
     return True
 
 
+def configure_telegram(config):
+    screen("Настроить отчёты в Telegram")
+    print("Добавьте бота в нужный чат и разрешите ему отправлять сообщения.\n")
+    hint = "Enter — оставить сохранённый" if config.telegram_token else "Enter без ввода — назад"
+    token = getpass.getpass(f"Токен бота ({hint}): ").strip() or config.telegram_token
+    if not token:
+        return
+    if not valid_telegram_token(token):
+        raise ValueError("Введите токен бота в формате, который выдаёт @BotFather.")
+    hint = f"Enter — оставить {config.telegram_chat_id}" if config.telegram_chat_id else "Enter без ввода — назад"
+    chat_id = input(f"Chat ID или @username ({hint}): ").strip() or config.telegram_chat_id
+    if not chat_id:
+        return
+    chat_id = normalize_chat_id(chat_id)
+    change_config(lambda current: replace(current, telegram_token=token, telegram_chat_id=chat_id))
+    print("Отчёты в Telegram включены.")
+    pause()
+
+
+def telegram_menu():
+    while True:
+        config = get_config()
+        items = [("configure", "Настроить бота и чат")]
+        detail = "Отчёты отключены."
+        if config.telegram_token:
+            detail = f"Чат для отчётов: {config.telegram_chat_id}"
+            items.extend([("test", "Отправить тестовое сообщение"),
+                          ("disable", "Отключить отчёты", RED)])
+        selected = choose(TELEGRAM_TITLE, items + [BACK], detail=detail)
+        if selected == "back":
+            return
+        try:
+            if selected == "configure":
+                configure_telegram(config)
+            elif selected == "test" and confirm("Отправить тестовое сообщение",
+                                                f"Watchdog отправит сообщение в чат {config.telegram_chat_id}."):
+                send_telegram(config.telegram_token, config.telegram_chat_id,
+                              "🛡 Cheburcheck Watchdog\n✅ Тестовое сообщение. Доставка отчётов работает.")
+                print("Тестовое сообщение отправлено.")
+                pause()
+            elif selected == "disable" and confirm("Отключить отчёты", "Токен бота и чат будут удалены из настроек."
+                                                   " Проверки продолжат записываться в журнал."):
+                change_config(lambda current: replace(current, telegram_token="", telegram_chat_id=""))
+                print("Отчёты в Telegram отключены.")
+                pause()
+        except (APIError, ResponseError, ValueError) as error:
+            print(f"{RED}[x]{RESET} {error}")
+            pause()
+
+
 def start_watchdog():
-    title = "Запустить watchdog"
-    if not confirm(title, "Watchdog начнёт проверять настроенные IP через Cheburcheck и будет "
-                    "автоматически запускаться при загрузке сервера."):
+    if not confirm("Запустить", "Watchdog начнёт проверять настроенные IP-адреса и домены через Cheburcheck. "
+                   "Служба будет запускаться при загрузке сервера."):
         return
     if not get_config().token and not token_menu():
         return
     if not get_config().targets:
-        print("Добавьте хотя бы один IP-адрес для запуска.")
-        input(f"\n{DIM}Enter — открыть список IP-адресов{RESET}")
-        ip_menu()
+        print("Добавьте хотя бы один IP-адрес или домен для запуска.")
+        input(f"\n{DIM}Enter — открыть список проверок{RESET}")
+        targets_menu()
         if not get_config().targets:
             return
     with install_lock():
         config = get_config()
         if not config.token or not config.targets:
-            raise ValueError("Укажите токен и хотя бы один IP-адрес.")
+            raise ValueError("Укажите токен и добавьте хотя бы один IP-адрес или домен.")
         systemctl("enable", "--now", UNIT)
     print("Watchdog запущен.")
     pause()
 
 
 def stop_watchdog():
-    if confirm("Остановить watchdog", "Проверки будут остановлены. Автозапуск при загрузке сервера "
+    if confirm("Остановить", "Проверки будут остановлены. Автозапуск при загрузке сервера "
                 "будет выключен. Настройки сохранятся."):
         with install_lock():
             systemctl("disable", "--now", UNIT)
@@ -197,45 +264,49 @@ def stop_watchdog():
         pause()
 
 
-def add_ip():
-    screen("Добавить IP-адрес")
-    value = input("Публичный IPv4 или IPv6 (Enter без ввода — назад): ").strip()
+def add_target():
+    screen("Добавить IP-адрес или домен")
+    value = input("Публичный IPv4, IPv6 или домен (Enter без ввода — назад): ").strip()
     if not value:
         return
-    target = normalize_ip(value)
+    target = normalize_target(value)
 
     def add(config):
         if target in config.targets:
-            raise ValueError("Этот IP-адрес уже в списке.")
+            raise ValueError("Этот IP-адрес или домен уже в списке.")
         return replace(config, targets=config.targets + (target,))
 
     change_config(add)
-    print(f"Адрес {target} добавлен.")
+    print(f"{target} добавлен в список проверок.")
     pause()
 
 
-def edit_ip(target):
-    if choose(target, [("remove", "Удалить IP-адрес", RED), BACK], default=1) != "remove":
+def edit_target(target):
+    if choose(target, [("remove", "Удалить из списка", RED), BACK], default=1) != "remove":
         return
-    if confirm("Удалить IP-адрес", f"Адрес {target} будет удалён из списка проверок. "
-               "При удалении последнего адреса watchdog будет остановлен, а автозапуск отключён."):
-        change_config(lambda config: replace(config, targets=tuple(ip for ip in config.targets if ip != target)))
-        print(f"Адрес {target} удалён.")
+    if confirm("Удалить из списка", f"{target} будет удалён из списка проверок. "
+               "Если список опустеет, служба остановится, а автозапуск отключится."):
+        change_config(lambda config: replace(config, targets=tuple(item for item in config.targets if item != target)))
+        print(f"{target} удалён из списка проверок.")
         pause()
 
 
-def ip_menu():
+def targets_menu():
     while True:
         targets = get_config().targets
-        items = [(target, target) for target in targets] + [("add", "Добавить IP-адрес"), BACK]
-        selected = choose("Проверяемые IP-адреса", items, default=len(targets),
-                          detail="Настроенные адреса" if targets else "Список пуст.")
+        items = [(target, target) for target in targets] + [("add", "Добавить IP-адрес или домен"), BACK]
+        selected = choose("Проверяемые IP и домены", items, default=len(targets),
+                          detail=None if targets else "Список пуст.")
         if selected == "back":
             return
-        if selected == "add":
-            add_ip()
-        else:
-            edit_ip(selected)
+        try:
+            if selected == "add":
+                add_target()
+            else:
+                edit_target(selected)
+        except ValueError as error:
+            print(f"{RED}[x]{RESET} {error}")
+            pause()
 
 
 def interval_menu():
@@ -249,9 +320,46 @@ def interval_menu():
         pause()
 
 
+def manual_check_menu():
+    config = get_config()
+    domains = tuple(target for target in config.targets if is_domain(target))
+    if not domains:
+        screen("Разовая проверка")
+        print("Добавьте домен в разделе «Проверяемые IP и домены».")
+        pause()
+        return
+    items = [("all", f"Все домены ({len(domains)})")]
+    items.extend((domain, domain) for domain in domains)
+    selected = choose("Разовая проверка", items + [BACK], default=len(items))
+    if selected == "back":
+        return
+    if not config.token and not token_menu():
+        return
+    if not config.telegram_token:
+        configure_telegram(config)
+
+    config = get_config()
+    if not config.token or not config.telegram_token:
+        return
+    targets = tuple(
+        target for target in config.targets if is_domain(target) and (selected == "all" or target == selected)
+    )
+    if not targets:
+        raise ValueError("Выбранных доменов больше нет в списке проверок.")
+    description = "Будут проверены все сохранённые домены." if selected == "all" else f"Будет проверен {selected}."
+    if not confirm("Разовая проверка", f"{description} Отчёт будет отправлен в Telegram, "
+                   f"в чат {config.telegram_chat_id}."):
+        return
+    with check_lock(wait=False):
+        print("Выполняется проверка…", flush=True)
+        check_batch(replace(config, targets=targets), manual=True)
+    print("Отчёт о проверке отправлен в Telegram.")
+    pause()
+
+
 def uninstall():
     if not confirm("Удалить Cheburcheck Watchdog", "Служба будет остановлена и удалена вместе с командой "
-                   "cheburcheck-watchdog, списком адресов, периодом проверки и API-токеном."):
+                   "cheburcheck-watchdog, настройками и сохранёнными токенами."):
         return False
     with install_lock():
         if UNIT_PATH.exists():
@@ -264,6 +372,8 @@ def uninstall():
             COMMAND_LINK.unlink()
         if CONFIG_PATH.parent.exists():
             shutil.rmtree(CONFIG_PATH.parent)
+        if CHECK_DIR.exists():
+            CHECK_DIR.rmdir()
         shutil.rmtree(APP_DIR)
     print("Cheburcheck Watchdog удалён.")
     return True
@@ -271,15 +381,18 @@ def uninstall():
 
 def main(update_notice=""):
     items = [
-        ("start", "Запустить watchdog"),
-        ("stop", "Остановить watchdog"),
-        ("token", "API-токен Watchdog"),
-        ("ip", "Проверяемые IP-адреса"),
+        ("start", "Запустить"),
+        ("stop", "Остановить"),
+        ("token", TOKEN_TITLE),
+        ("telegram", TELEGRAM_TITLE),
+        ("targets", "Проверяемые IP и домены"),
         ("interval", "Период проверки"),
+        ("manual", "Разовая проверка"),
         ("uninstall", "Удалить Cheburcheck Watchdog", RED),
         ("back", "Выход", BLUE),
     ]
-    actions = {"start": start_watchdog, "stop": stop_watchdog, "ip": ip_menu, "interval": interval_menu}
+    actions = {"start": start_watchdog, "stop": stop_watchdog, "telegram": telegram_menu,
+               "targets": targets_menu, "interval": interval_menu, "manual": manual_check_menu}
 
     def detail():
         status = service_status()
@@ -302,7 +415,7 @@ def main(update_notice=""):
         except (OSError, subprocess.CalledProcessError) as error:
             print(f"{RED}[x]{RESET} Операция не завершена: {error}")
             pause()
-        except (ValueError, RecursionError) as error:
+        except (APIError, ResponseError, ValueError, RecursionError) as error:
             print(f"{RED}[x]{RESET} {error}")
             pause()
         update_notice = ""

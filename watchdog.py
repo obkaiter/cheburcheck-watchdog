@@ -1,3 +1,4 @@
+import fcntl
 import ipaddress
 import json
 import logging
@@ -6,18 +7,21 @@ import os
 import re
 import ssl
 import time
+import unicodedata
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException, HTTPSConnection
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Optional, Union
 from urllib.parse import quote, urlencode
 
 
 CONFIG_PATH = Path("/etc/cheburcheck-watchdog/config.json")
+CHECK_DIR = Path("/run/cheburcheck-watchdog")
 INTERVALS = {
     3600: "Раз в час",
     10800: "Раз в 3 часа",
@@ -31,6 +35,9 @@ DEFAULT_INTERVAL = 21600
 BETWEEN_TARGETS = 5
 API_HOST = "cheburcheck.ru"
 API_ROOT = "/api/v1"
+TELEGRAM_HOST = "api.telegram.org"
+TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_MESSAGE_GAP = 4
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 SSE_TIMEOUT = 90
 VERDICTS = {
@@ -50,15 +57,18 @@ class Config:
     token: str = field(default="", repr=False)
     targets: tuple = ()
     interval: int = DEFAULT_INTERVAL
+    telegram_token: str = field(default="", repr=False)
+    telegram_chat_id: str = ""
 
 
-def normalize_ip(raw):
+def normalize_target(raw):
     if not isinstance(raw, str) or "%" in raw:
-        raise ValueError("Введите публичный IPv4- или IPv6-адрес.")
+        raise ValueError("Введите публичный IP-адрес или домен.")
+    raw = raw.strip()
     try:
-        address = ipaddress.ip_address(raw.strip())
+        address = ipaddress.ip_address(raw)
     except ValueError:
-        raise ValueError("Введите публичный IPv4- или IPv6-адрес.") from None
+        return normalize_domain(raw)
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
         address = address.ipv4_mapped
     if not address.is_global or address.is_multicast or address.is_reserved:
@@ -66,8 +76,44 @@ def normalize_ip(raw):
     return str(address)
 
 
+def normalize_domain(raw):
+    domain = unicodedata.normalize("NFC", raw.removesuffix(".").lower())
+    try:
+        ascii_domain = domain.encode("idna").decode("ascii")
+        if not domain.isascii() and ascii_domain.encode("ascii").decode("idna") != domain:
+            raise ValueError("Введите этот домен в формате Punycode.")
+    except UnicodeError:
+        raise ValueError("Введите полное доменное имя, например example.com.") from None
+    labels = ascii_domain.split(".")
+    if (len(ascii_domain) > 253 or len(labels) < 2 or labels[-1].isdigit() or
+            any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)):
+        raise ValueError("Введите полное доменное имя, например example.com.")
+    return ascii_domain
+
+
+def is_domain(target):
+    try:
+        ipaddress.ip_address(target)
+    except ValueError:
+        return True
+    return False
+
+
 def valid_token(token):
     return isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9._~+/=-]{1,1024}", token)
+
+
+def valid_telegram_token(token):
+    return isinstance(token, str) and re.fullmatch(r"[0-9]{1,20}:[A-Za-z0-9_-]{1,128}", token)
+
+
+def normalize_chat_id(value):
+    if isinstance(value, str):
+        if re.fullmatch(r"-?[1-9][0-9]{0,15}", value) and abs(int(value)) < 2**52:
+            return value
+        if re.fullmatch(r"@[A-Za-z0-9_]{1,32}", value):
+            return value.lower()
+    raise ValueError("Укажите числовой Chat ID или @username группы либо канала.")
 
 
 def load_config(path=CONFIG_PATH, *, allow_missing=False):
@@ -82,11 +128,18 @@ def load_config(path=CONFIG_PATH, *, allow_missing=False):
     token = data.get("token", "")
     targets = data.get("targets", [])
     interval = data.get("interval", DEFAULT_INTERVAL)
+    telegram_token = data.get("telegram_token", "")
+    telegram_chat_id = data.get("telegram_chat_id", "")
     if (token != "" and not valid_token(token)) or not isinstance(targets, list):
-        raise ValueError("Некорректный токен или список адресов в конфигурации.")
+        raise ValueError("Некорректный токен Cheburcheck или список проверок в конфигурации.")
     if type(interval) is not int or interval not in INTERVALS:
         raise ValueError("Некорректный период проверки в конфигурации.")
-    return Config(token, tuple(dict.fromkeys(map(normalize_ip, targets))), interval)
+    if telegram_token != "" or telegram_chat_id != "":
+        if not valid_telegram_token(telegram_token):
+            raise ValueError("Некорректный токен бота Telegram в конфигурации.")
+        telegram_chat_id = normalize_chat_id(telegram_chat_id)
+    return Config(token, tuple(dict.fromkeys(map(normalize_target, targets))), interval,
+                  telegram_token, telegram_chat_id)
 
 
 def save_config(config, path=CONFIG_PATH):
@@ -117,6 +170,15 @@ class ResponseError(Exception):
     pass
 
 
+@dataclass
+class CheckResult:
+    target: str
+    blocked: Optional[bool] = None
+    scanners: str = ""
+    scanner_warning: bool = False
+    error: Optional[Union[APIError, ResponseError]] = None
+
+
 def retry_delay(value):
     if not value:
         return 0
@@ -132,23 +194,23 @@ def retry_delay(value):
 
 
 @contextmanager
-def request(stage, path, media_type, token=None):
+def request(stage, path, media_type, *, token=None, host=API_HOST, body=None):
     headers = {"Accept": media_type, "User-Agent": "Cheburcheck-Watchdog"}
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
-    connection = HTTPSConnection(API_HOST, timeout=20, context=ssl.create_default_context())
+    if body is not None:
+        headers["Content-Type"] = "application/json"
     try:
-        connection.request("GET", API_ROOT + path, headers=headers)
-        with connection.getresponse() as response:
-            if response.status != 200:
-                raise APIError(stage, response.status, retry_delay(response.getheader("Retry-After")))
-            if response.headers.get_content_type() != media_type:
-                raise ResponseError(f"{stage}: неожиданный тип ответа")
-            yield response
+        with closing(HTTPSConnection(host, timeout=20, context=ssl.create_default_context())) as connection:
+            connection.request("POST" if body is not None else "GET", path, body=body, headers=headers)
+            with connection.getresponse() as response:
+                if response.status != 200:
+                    raise APIError(stage, response.status, retry_delay(response.getheader("Retry-After")))
+                if response.headers.get_content_type() != media_type:
+                    raise ResponseError(f"{stage}: неожиданный тип ответа")
+                yield response
     except (OSError, HTTPException) as error:
         raise ResponseError(f"{stage}: сбой соединения ({type(error).__name__})") from None
-    finally:
-        connection.close()
 
 
 def decode_object(raw, stage):
@@ -161,13 +223,18 @@ def decode_object(raw, stage):
     return data
 
 
-def check_lists(target):
-    query = urlencode({"target": target})
-    with request("Проверка по спискам", f"/check?{query}", "application/json") as response:
-        raw = response.read(MAX_RESPONSE_BYTES + 1)
+def read_json(response, stage):
+    raw = response.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
-        raise ResponseError("Проверка по спискам: превышен размер ответа")
-    result = decode_object(raw, "Проверка по спискам")
+        raise ResponseError(f"{stage}: превышен размер ответа")
+    return decode_object(raw, stage)
+
+
+def check_lists(target):
+    stage = "Проверка по спискам"
+    query = urlencode({"target": target})
+    with request(stage, f"{API_ROOT}/check?{query}", "application/json") as response:
+        result = read_json(response, stage)
     if type(result.get("blocked")) is not bool:
         raise ResponseError("Проверка по спискам: отсутствует признак блокировки")
     return result
@@ -201,10 +268,10 @@ def sse_events(response):
     raise ResponseError("Сканеры: превышен лимит размера или времени ожидания SSE")
 
 
-def scan_ip(context_id, token):
-    path = "/probe/" + quote(context_id, safe="")
+def scan_target(context_id, token):
+    path = f"{API_ROOT}/probe/" + quote(context_id, safe="")
     results = {}
-    with request("Сканеры", path, "text/event-stream", token) as response:
+    with request("Сканеры", path, "text/event-stream", token=token) as response:
         for event, raw in sse_events(response):
             if event == "result":
                 result = decode_object(raw, "Ответ сканера")
@@ -224,15 +291,21 @@ def scan_ip(context_id, token):
 
 
 def check_target(target, token):
-    lists = check_lists(target)
-    LOG.log(logging.WARNING if lists["blocked"] else logging.INFO, "%s — по спискам: %s", target,
-            "найдена блокировка" if lists["blocked"] else "блокировка не найдена")
-    context_id = lists.get("id")
-    if not isinstance(context_id, str) or not context_id:
-        LOG.warning("%s — контекст для сетевых сканеров недоступен", target)
-        return
+    report = CheckResult(target)
+    try:
+        lists = check_lists(target)
+        report.blocked = lists["blocked"]
+        LOG.log(logging.WARNING if report.blocked else logging.INFO, "%s — по спискам: %s", target,
+                "найдена блокировка" if report.blocked else "блокировка не найдена")
+        context_id = lists.get("id")
+        if not isinstance(context_id, str) or not context_id:
+            raise ResponseError("Контекст для сетевых сканеров недоступен")
+        results, received, online = scan_target(context_id, token)
+    except (APIError, ResponseError) as error:
+        report.error = error
+        LOG.warning("%s — %s", target, error)
+        return report
 
-    results, received, online = scan_ip(context_id, token)
     counts = Counter()
     for result in results.values():
         counts.update({verdict for verdict in result["verdicts"]
@@ -241,29 +314,103 @@ def check_target(target, token):
                         for verdict in VERDICTS if counts[verdict]) or "вердиктов нет"
     cached = sum(result.get("cached") is True for result in results.values())
     incomplete = not results or received < online or received != len(results)
-    level = logging.WARNING if incomplete or counts["tspu_block"] else logging.INFO
-    LOG.log(level, "%s — сканеры: %d из %d, из кеша: %d. %s%s", target, len(results), online,
-            cached, summary, " (неполный результат)" if incomplete else "")
+    report.scanners = f"{len(results)} из {online}, из кеша: {cached}. {summary}"
+    if incomplete:
+        report.scanners += " (неполный результат)"
+    report.scanner_warning = incomplete or any(
+        counts[key] for key in ("uncertain", "cdn_block", "sni_block", "dns_spoofing", "tspu_block")
+    )
+    level = logging.WARNING if report.scanner_warning else logging.INFO
+    LOG.log(level, "%s — сканеры: %s", target, report.scanners)
+    return report
 
 
-def check_batch(config):
+def send_telegram(token, chat_id, text):
+    body = json.dumps({
+        "chat_id": chat_id if chat_id.startswith("@") else int(chat_id),
+        "text": text,
+        "link_preview_options": {"is_disabled": True},
+    }, ensure_ascii=False).encode("utf-8")
+    with request("Telegram", f"/bot{token}/sendMessage", "application/json",
+                 host=TELEGRAM_HOST, body=body) as response:
+        result = read_json(response, "Telegram")
+    if result.get("ok") is not True:
+        raise ResponseError("Telegram не подтвердил отправку сообщения")
+
+
+def report_messages(reports, total, notice, *, manual):
+    time_label = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    label = "Разовая проверка" if manual else "Проверка по расписанию"
+    header = (f"🛡 Cheburcheck Watchdog\n🕒 {label} · {time_label}"
+              f"\n🔎 Целей обработано: {len(reports)} из {total}")
+    if notice:
+        header += f"\n⚠️ {notice}"
+    message = header
+    for report in reports:
+        lines = [f"🌐 {report.target}"]
+        if report.blocked is not None:
+            lines.append("🚫 По спискам: найдена блокировка" if report.blocked
+                         else "✅ По спискам: блокировка не найдена")
+        if report.scanners:
+            icon = "⚠️" if report.scanner_warning else "📡"
+            lines.append(f"{icon} Сканеры: {report.scanners}")
+        if report.error:
+            lines.append(f"⚠️ {report.error}")
+        block = "\n\n" + "\n".join(lines)
+        if len((message + block).encode("utf-16-le")) // 2 > TELEGRAM_MESSAGE_LIMIT:
+            yield message
+            message = header
+        message += block
+    yield message
+
+
+@contextmanager
+def check_lock(*, wait):
+    if not wait:
+        CHECK_DIR.mkdir(mode=0o700, exist_ok=True)
+    fd = os.open(CHECK_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ResponseError("Уже выполняется проверка. Повторите попытку после её завершения.") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def check_batch(config, *, manual=False):
+    reports = []
+    delay = 0
+    notice = ""
     for index, target in enumerate(config.targets):
         if index:
             time.sleep(BETWEEN_TARGETS)
-        try:
-            check_target(target, config.token)
-        except APIError as error:
-            LOG.warning("%s — %s", target, error)
+        report = check_target(target, config.token)
+        if config.telegram_token:
+            reports.append(report)
+        error = report.error
+        if isinstance(error, APIError):
             if error.status == 429:
                 delay = max(config.interval, error.retry_after)
-                LOG.warning("Лимит API: следующий цикл не ранее чем через %d сек.", delay)
-                return delay
-            if error.status == 401 and error.stage == "Сканеры":
-                LOG.warning("Проверьте API-токен и его срок действия.")
+                notice = f"Лимит Cheburcheck. Следующий цикл не ранее чем через {delay} сек."
+                LOG.warning("%s", notice)
                 break
-        except ResponseError as error:
-            LOG.warning("%s — %s", target, error)
-    return 0
+            if error.status == 401 and error.stage == "Сканеры":
+                notice = "Проверьте API-токен cheburcheck.ru и его срок действия."
+                LOG.warning("%s", notice)
+                break
+    if reports:
+        try:
+            for index, message in enumerate(report_messages(reports, len(config.targets), notice, manual=manual)):
+                if index:
+                    time.sleep(TELEGRAM_MESSAGE_GAP)
+                send_telegram(config.telegram_token, config.telegram_chat_id, message)
+        except (APIError, ResponseError) as error:
+            if manual:
+                raise ResponseError(f"Проверка завершена. Не удалось отправить отчёт. {error}") from None
+            LOG.warning("Не удалось отправить отчёт: %s", error)
+    return delay
 
 
 def main():
@@ -274,11 +421,12 @@ def main():
         LOG.error("Не удалось загрузить конфигурацию службы.")
         return 78
     if not config.token or not config.targets:
-        LOG.error("Укажите API-токен и хотя бы один IP-адрес через меню Watchdog.")
+        LOG.error("Укажите API-токен и добавьте хотя бы один IP-адрес или домен через меню Watchdog.")
         return 78
-    LOG.info("Адресов для проверки: %d. Период: %s.", len(config.targets), INTERVALS[config.interval])
+    LOG.info("Целей для проверки: %d. Период: %s.", len(config.targets), INTERVALS[config.interval])
     while True:
-        retry_after = check_batch(config)
+        with check_lock(wait=True):
+            retry_after = check_batch(config)
         wake_at = time.monotonic() + max(config.interval, retry_after)
         while (remaining := wake_at - time.monotonic()) > 0:
             time.sleep(min(3600, remaining))
