@@ -472,27 +472,28 @@ def send_telegram(token, chat_id, text, *, topic_id=None, message_id=None):
     return result.get("result", True)
 
 
-def publish_report(config, text):
+def publish_report(config, text, *, edit_existing=True):
     path = STATE_DIR / "telegram-report.json"
     STATE_DIR.mkdir(mode=0o700, exist_ok=True)
     destination = [config.telegram_token.partition(":")[0], config.telegram_chat_id,
                    None if config.telegram_topic_id == 1 else config.telegram_topic_id]
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        state = {}
-    except (ValueError, RecursionError):
-        raise ResponseError("Некорректный файл состояния отчёта Telegram") from None
-    if not isinstance(state, dict):
-        raise ResponseError("Некорректный файл состояния отчёта Telegram")
-    if state.get("destination") == destination:
-        message_id = state.get("message_id")
-        chat_id = state.get("chat_id")
-        if type(message_id) is not int or message_id <= 0 or type(chat_id) is not int or chat_id == 0:
-            raise ResponseError("Некорректный идентификатор сохранённого отчёта Telegram")
-        if send_telegram(config.telegram_token, str(chat_id), text, message_id=message_id) is not None:
-            LOG.info("Общий отчёт Telegram обновлён (чат %d, сообщение %d).", chat_id, message_id)
-            return
+    if edit_existing:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            state = {}
+        except (ValueError, RecursionError):
+            raise ResponseError("Некорректный файл состояния отчёта Telegram") from None
+        if not isinstance(state, dict):
+            raise ResponseError("Некорректный файл состояния отчёта Telegram")
+        if state.get("destination") == destination:
+            message_id = state.get("message_id")
+            chat_id = state.get("chat_id")
+            if type(message_id) is not int or message_id <= 0 or type(chat_id) is not int or chat_id == 0:
+                raise ResponseError("Некорректный идентификатор сохранённого отчёта Telegram")
+            if send_telegram(config.telegram_token, str(chat_id), text, message_id=message_id) is not None:
+                LOG.info("Общий отчёт Telegram обновлён (чат %d, сообщение %d).", chat_id, message_id)
+                return
 
     message = send_telegram(config.telegram_token, config.telegram_chat_id, text, topic_id=config.telegram_topic_id)
     if not isinstance(message, dict) or not isinstance(message.get("chat"), dict):
@@ -598,7 +599,7 @@ def check_batch(config, *, manual=False, update_report=True):
         try:
             message = report_message(reports, len(config.targets), notice, manual=manual)
             if update_report:
-                publish_report(config, message)
+                publish_report(config, message, edit_existing=manual)
             else:
                 send_telegram(config.telegram_token, config.telegram_chat_id, message,
                               topic_id=config.telegram_topic_id)
