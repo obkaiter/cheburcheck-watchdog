@@ -491,6 +491,7 @@ def publish_report(config, text):
         if type(message_id) is not int or message_id <= 0 or type(chat_id) is not int or chat_id == 0:
             raise ResponseError("Некорректный идентификатор сохранённого отчёта Telegram")
         if send_telegram(config.telegram_token, str(chat_id), text, message_id=message_id) is not None:
+            LOG.info("Общий отчёт Telegram обновлён (чат %d, сообщение %d).", chat_id, message_id)
             return
 
     message = send_telegram(config.telegram_token, config.telegram_chat_id, text, topic_id=config.telegram_topic_id)
@@ -502,6 +503,7 @@ def publish_report(config, text):
         raise ResponseError("Telegram не вернул идентификатор отправленного отчёта")
     # The admin and the DynamicUser both read this file inside the private state directory.
     write_json({"destination": destination, "chat_id": chat_id, "message_id": message_id}, path, mode=0o644)
+    LOG.info("Общий отчёт Telegram создан (чат %d, сообщение %d).", chat_id, message_id)
 
 
 def telegram_length(text):
@@ -618,14 +620,20 @@ def main():
         LOG.error("Укажите API-токен и добавьте хотя бы один IP-адрес или домен через меню Watchdog.")
         return 78
     LOG.info("Целей для проверки: %d. Период: %s.", len(config.targets), INTERVALS[config.interval])
+    if not config.telegram_token:
+        LOG.info("Отчёты в Telegram отключены. Результаты проверок записываются в журнал.")
     while True:
-        retry_after = 0
         try:
             with check_lock(wait=True):
+                started_at = time.monotonic()
+                LOG.info("Начат автоматический цикл проверок.")
                 retry_after = check_batch(config)
         except (OSError, ResponseError) as error:
             LOG.error("Не удалось выполнить цикл проверок. %s", error)
-        wake_at = time.monotonic() + max(config.interval, retry_after)
+            wake_at = time.monotonic() + config.interval
+        else:
+            wake_at = max(started_at + config.interval, time.monotonic() + retry_after)
+        LOG.info("Следующий автоматический цикл через %d сек.", max(0, math.ceil(wake_at - time.monotonic())))
         while (remaining := wake_at - time.monotonic()) > 0:
             time.sleep(min(3600, remaining))
 

@@ -146,9 +146,12 @@ def is_active():
 
 
 def service_status():
-    if is_active():
-        return f"Статус: {GREEN}работает{RESET}"
-    return f"Статус: {RED}остановлен{RESET}"
+    status = f"{GREEN}работает{RESET}" if is_active() else f"{RED}остановлена{RESET}"
+    try:
+        telegram = "настроены" if get_config().telegram_token else "отключены"
+    except (OSError, ValueError, RecursionError):
+        telegram = "не удалось прочитать настройки"
+    return f"Статус службы: {status}\nОтчёты в Telegram: {telegram}"
 
 
 @contextmanager
