@@ -563,12 +563,13 @@ def report_message(reports, total, notice, *, manual):
         verdict_icon, status = VERDICT_STATUS[report.verdict]
         label = "Итог по полученным данным" if report.incomplete else "Итог"
         lines.append(f"{verdict_icon} {label}: {status}")
-        if report.blocked is not None:
-            listed = "есть совпадение" if report.blocked else "совпадений нет"
-            lines.append(f"📋 Списки Cheburcheck: {listed}")
-        if report.ban_detected and report.scanners:
-            icon = "⚠️" if report.incomplete else "📡"
-            lines.append(f"{icon} Сканеры API: {report.scanners}")
+        if report.ban_detected:
+            if report.blocked is not None:
+                listed = "есть совпадение" if report.blocked else "совпадений нет"
+                lines.append(f"📋 Списки Cheburcheck: {listed}")
+            if report.scanners:
+                icon = "⚠️" if report.incomplete else "📡"
+                lines.append(f"{icon} Сканеры API: {report.scanners}")
         if report.error:
             lines.append(f"⚠️ {report.error}")
         blocks.append("\n".join(lines))
