@@ -24,6 +24,7 @@ CONFIG_PATH = Path("/etc/cheburcheck-watchdog/config.json")
 CHECK_DIR = Path("/run/cheburcheck-watchdog")
 STATE_DIR = Path("/var/lib/cheburcheck-watchdog")
 COOLDOWN_PATH = STATE_DIR / "check-cooldown.json"
+BAN_STREAK_PATH = STATE_DIR / "ban-streak.json"
 INTERVALS = {
     3600: "Раз в час",
     10800: "Раз в 3 часа",
@@ -206,15 +207,22 @@ class CheckInProgress(ResponseError):
     pass
 
 
-def check_delay():
+def read_state_timestamp(path, error_message):
     try:
-        deadline = json.loads(COOLDOWN_PATH.read_text(encoding="utf-8"))
-        if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline < 0:
+        timestamp = json.loads(path.read_text(encoding="utf-8"))
+        if type(timestamp) not in (int, float) or not math.isfinite(timestamp) or timestamp < 0:
             raise ValueError
     except FileNotFoundError:
-        return 0.0
+        return None
     except (ValueError, RecursionError, OverflowError):
-        raise ResponseError("Не удалось прочитать время следующей проверки Cheburcheck") from None
+        raise ResponseError(error_message) from None
+    return timestamp
+
+
+def check_delay():
+    deadline = read_state_timestamp(COOLDOWN_PATH, "Не удалось прочитать время следующей проверки Cheburcheck")
+    if deadline is None:
+        return 0.0
     return max(0.0, deadline - time.time())
 
 
@@ -250,6 +258,34 @@ class CheckResult:
     scanners: str = ""
     incomplete: bool = False
     error: Optional[Union[APIError, ResponseError]] = None
+    blocked_by_lists: bool = False
+
+    @property
+    def ban_detected(self):
+        return self.blocked_by_lists or self.verdict in BLOCKING_VERDICTS
+
+
+def read_ban_streak_start():
+    return read_state_timestamp(BAN_STREAK_PATH, "Не удалось прочитать счётчик дней без бана")
+
+
+def update_ban_streak(report):
+    if report.ban_detected:
+        write_json(time.time(), BAN_STREAK_PATH, mode=0o644)
+    elif report.verdict == "ok" and not report.incomplete and report.error is None:
+        if read_ban_streak_start() is None:
+            write_json(time.time(), BAN_STREAK_PATH, mode=0o644)
+
+
+def ban_streak_status():
+    try:
+        started_at = read_ban_streak_start()
+    except (OSError, ResponseError):
+        return "Дней без бана: недоступно"
+    if started_at is None:
+        return "Дней без бана: нет данных"
+    days = max(0, int((time.time() - started_at) // 86400))
+    return f"Дней без бана: {days}"
 
 
 def retry_delay(value):
@@ -405,6 +441,7 @@ def check_target(target, token):
         if isinstance(lists.get("whitelist"), dict) and not lists.get("rkn_domain"):
             report.verdict = "whitelist"
         elif report.blocked:
+            report.blocked_by_lists = True
             report.verdict = "blocked"
         context_id = lists.get("id")
         if not isinstance(context_id, str) or not context_id:
@@ -515,7 +552,8 @@ def report_message(reports, total, notice, *, manual):
     time_label = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     label = "Разовая проверка" if manual else "Проверка по расписанию"
     header = (f"🛡 Cheburcheck Watchdog\n🕒 {label} · {time_label}"
-              f"\n🔎 Целей обработано: {len(reports)} из {total}")
+              f"\n🔎 Целей обработано: {len(reports)} из {total}"
+              f"\n📅 {ban_streak_status()}")
     if notice:
         header += f"\n⚠️ {notice}"
     blocks = []
@@ -528,7 +566,7 @@ def report_message(reports, total, notice, *, manual):
         if report.blocked is not None:
             listed = "есть совпадение" if report.blocked else "совпадений нет"
             lines.append(f"📋 Списки Cheburcheck: {listed}")
-        if report.scanners:
+        if report.ban_detected and report.scanners:
             icon = "⚠️" if report.incomplete else "📡"
             lines.append(f"{icon} Сканеры API: {report.scanners}")
         if report.error:
@@ -581,6 +619,10 @@ def check_batch(config, *, manual=False, update_report=True):
         wait_for_next_check(wait=not manual or index > 0)
         defer_check()
         report = check_target(target, config.token)
+        try:
+            update_ban_streak(report)
+        except (OSError, ResponseError) as error:
+            LOG.warning("Не удалось обновить счётчик дней без бана. %s", error)
         if config.telegram_token:
             reports.append(report)
         error = report.error

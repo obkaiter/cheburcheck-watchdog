@@ -20,6 +20,7 @@ from watchdog import (
     INTERVALS,
     STATE_DIR,
     ResponseError,
+    ban_streak_status,
     check_batch,
     check_delay,
     check_lock,
@@ -151,7 +152,7 @@ def service_status():
         telegram = "настроены" if get_config().telegram_token else "отключены"
     except (OSError, ValueError, RecursionError):
         telegram = "не удалось прочитать настройки"
-    return f"Статус службы: {status}\nОтчёты в Telegram: {telegram}"
+    return f"Статус службы: {status}\nОтчёты в Telegram: {telegram}\n{ban_streak_status()}"
 
 
 @contextmanager
